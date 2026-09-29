@@ -1,0 +1,194 @@
+name: deploy
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Domyślnie żaden job nic nie może — każdy dostaje tylko to, czego potrzebuje.
+permissions: {}
+
+env:
+  AWS_REGION: eu-central-1
+  ECR_REPOSITORY: quotes-api
+  EKS_CLUSTER_NAME: szkolenie-ai-devops
+
+jobs:
+  lint:
+    name: lint (ruff)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # Job tylko czyta kod repo (checkout) i nic więcej nie robi.
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Instaluj zależności
+        run: pip install -r requirements-dev.txt
+
+      - name: ruff check
+        run: ruff check .
+
+  test:
+    name: test (pytest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Job tylko czyta kod repo (checkout) i nic więcej nie robi.
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Instaluj zależności
+        run: pip install -r requirements-dev.txt
+
+      - name: pytest
+        run: pytest --junitxml=test-results/junit.xml
+
+      - name: Upload wyników testów
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-${{ github.run_id }}
+          path: app/test-results/junit.xml
+          # Przykładowa wartość, nie wynik analizy: w repo nie ma udokumentowanej
+          # polityki retencji. 7 dni ma pokryć typowy cykl review PR (otwarcie,
+          # poprawki, merge) z zapasem na dłuższy weekend — nie dane z realnego
+          # projektu. Do dostrojenia po zaobserwowaniu, jak długo faktycznie
+          # wracacie do wyników nieudanych PR-ów.
+          retention-days: 7
+
+  build:
+    name: build i push do ECR
+    needs: [lint, test]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Tylko z main: nie budujemy i nie pushujemy obrazu dla PR-ów, także z forków.
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    # contents: read — checkout kodu.
+    # id-token: write — jedyny sposób, by ten job poprosił GitHuba o token OIDC
+    #   i wymienił go (przez aws-actions/configure-aws-credentials) na krótkotrwałe
+    #   poświadczenia AWS. Bez długoterminowych kluczy w sekretach.
+    # O tym, co job faktycznie może zrobić w AWS, decyduje trust policy roli
+    # AWS_DEPLOY_ROLE_ARN, nie to uprawnienie.
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      image: ${{ steps.image.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Konfiguruj poświadczenia AWS (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Zaloguj do ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build i push obrazu
+        id: image
+        env:
+          REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          IMAGE="${REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
+          docker build \
+            --build-arg APP_VERSION="${IMAGE_TAG}" \
+            -t "${IMAGE}" \
+            app
+          docker push "${IMAGE}"
+          echo "image=${IMAGE}" >> "$GITHUB_OUTPUT"
+
+      - name: Zapisz metadane wydania
+        env:
+          IMAGE: ${{ steps.image.outputs.image }}
+        run: |
+          mkdir -p release-meta
+          {
+            echo "image=${IMAGE}"
+            echo "commit=${{ github.sha }}"
+            echo "built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } > release-meta/release.txt
+
+      - name: Upload metadanych wydania
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ github.sha }}
+          path: release-meta/release.txt
+          # Przykładowa wartość, nie wynik analizy: w repo nie ma udokumentowanej
+          # polityki retencji ani wymogu audytowego. 90 dni to zaokrąglony,
+          # często spotykany domyślny limit organizacyjny na GitHubie (nie
+          # potwierdzony dla tego konta) — na tyle długo, by odtworzyć, co
+          # trafiło na klaster, jeśli okaże się to potrzebne miesiąc później.
+          # Do zastąpienia realnym wymogiem (np. z polityki audytu albo SLA
+          # wsparcia), gdy taki się pojawi.
+          retention-days: 90
+
+  deploy:
+    name: deploy na EKS
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Tylko z main, jak build — deploy nigdy nie odpala się z pull requesta.
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    # contents: read — checkout manifestów z app/k8s-dzien1/.
+    # id-token: write — OIDC do AWS, żeby uzyskać kubeconfig do klastra EKS
+    #   (aws eks update-kubeconfig korzysta z tych samych poświadczeń co build).
+    # Bez environment: — dodanie go zmienia claim `sub` w tokenie OIDC i psuje
+    # trust policy roli (patrz Podpowiedź 4 w README labu).
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Konfiguruj poświadczenia AWS (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Aktualizuj kubeconfig
+        run: |
+          aws eks update-kubeconfig \
+            --name ${{ env.EKS_CLUSTER_NAME }} \
+            --region ${{ env.AWS_REGION }}
+
+      - name: Podmień obraz w manifeście
+        env:
+          IMAGE: ${{ needs.build.outputs.image }}
+        run: |
+          set -euo pipefail
+          sed -i "s#PODMIEN_NA_OBRAZ#${IMAGE}#" app/k8s-dzien1/deployment.yaml
+
+      - name: Wdróż manifesty
+        run: |
+          kubectl apply -n ${{ vars.K8S_NAMESPACE }} -f app/k8s-dzien1/deployment.yaml
+          kubectl apply -n ${{ vars.K8S_NAMESPACE }} -f app/k8s-dzien1/service.yaml
+
+      - name: Czekaj, aż Deployment będzie gotowy
+        run: |
+          kubectl rollout status deployment/quotes-api-d1 \
+            -n ${{ vars.K8S_NAMESPACE }} \
+            --timeout=180s
