@@ -1,5 +1,9 @@
 # Infrastruktura pod quotes-api. Konwencje nazw i tagów: .claude/CLAUDE.md
 
+provider "aws" {
+  region = var.region
+}
+
 locals {
   prefix = "szkolenie-${var.blok}-${var.uczestnik}"
 
